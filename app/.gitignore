@@ -1,0 +1,8 @@
+/build
+/*iml
+/*.jks
+/debug.keystore
+
+.sonar
+
+/release.properties

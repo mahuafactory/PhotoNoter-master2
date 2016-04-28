@@ -1,0 +1,502 @@
+import java.util.jar.JarEntry
+import java.util.jar.JarFile
+import java.util.regex.Matcher
+import java.util.regex.Pattern
+
+task autoSplitDex << {
+    if (description == null) {
+        println("\n\n\ndescription == null\n\n\n")
+        return;
+    }
+    def flavor = null
+    def buildType = null
+    def flavorAndBuildType = description
+    if (flavorAndBuildType.toLowerCase().contains("debug")) {
+        flavor = flavorAndBuildType.substring(0, flavorAndBuildType.length() - "debug".length())
+        buildType = "debug"
+    } else {
+        flavor = flavorAndBuildType.substring(0, flavorAndBuildType.length() - "release".length())
+        buildType = "release"
+    }
+
+    //src/main/java/
+    def srcPath = "${projectDir}${File.separator}" +
+            "src${File.separator}" +
+            "main${File.separator}" +
+            "java${File.separator}"
+
+    //build/generated/source/apt/Store360/debug/
+    def buildSourcePath = "${projectDir}${File.separator}" +
+            "build${File.separator}" +
+            "generated${File.separator}" +
+            "source${File.separator}" +
+            "apt${File.separator}" +
+            "${flavor}${File.separator}" +
+            "${buildType}${File.separator}"
+    //build/intermediates/multi-dex/Store360/debug/allclasses.jar
+    def jarDebugPath = "${projectDir}${File.separator}" +
+            "build${File.separator}" +
+            "intermediates${File.separator}" +
+            "multi-dex${File.separator}" +
+            "${flavor}${File.separator}" +
+            "${buildType}${File.separator}" +
+            "allclasses.jar"
+    //build/intermediates/classes-proguard/Store360/release/classes.jar
+    def jarReleasePath = "${projectDir}${File.separator}" +
+            "build${File.separator}" +
+            "intermediates${File.separator}" +
+            "classes-proguard${File.separator}" +
+            "${flavor}${File.separator}" +
+            "${buildType}${File.separator}" +
+            "classes.jar"
+    //build/intermediates/multi-dex/Store360/debug/maindexlist.txt
+    def mainDexListPath = "${projectDir}${File.separator}" +
+            "build${File.separator}" +
+            "intermediates${File.separator}" +
+            "multi-dex${File.separator}" +
+            "${flavor}${File.separator}" +
+            "${buildType}${File.separator}" +
+            "maindexlist.txt"
+    //support.keep
+    def supportKeepPath = "${projectDir}${File.separator}support.keep"
+    //multidex.keep
+    def multiDexKeepPath = "${projectDir}${File.separator}multidex.keep"
+    ///build/outputs/mapping/Store360/debug/mapping.txt
+    def mappingTxtPath = "${projectDir}${File.separator}" +
+            "build${File.separator}" +
+            "outputs${File.separator}" +
+            "mapping${File.separator}" +
+            "${flavor}${File.separator}" +
+            "${buildType}${File.separator}" +
+            "mapping.txt"
+
+    //需要找依赖的类的列表
+    Set<String> needFindDependencyList = new HashSet<>();
+    //找到四大组件
+    findComponent(flavor, buildType, needFindDependencyList)
+    //找到项目需要放进第一个dex的
+    findNeededPresenters(needFindDependencyList)
+    //需要放进第一个dex的类的列表
+    Set<String> packageJavaSet = new HashSet<>();
+    //找出依赖
+    for (Iterator<String> iterator = needFindDependencyList.iterator(); iterator.hasNext();) {
+        def packageName = iterator.next()
+        def packagePath = packageName.replace(".", File.separator) + ".java"
+        def totalPath = srcPath + packagePath
+        def file = new File(totalPath)
+        if (file.exists()) {
+            getDependentJava(file, packageJavaSet)
+        }
+        //把自己也加进去
+        packageJavaSet.add(iterator.next())
+    }
+    //找到ButterKnife和Dagger2生成的代码
+    addAllBuildDependency(buildSourcePath, packageJavaSet)
+    //把自己也加进去
+    addBuildSelf(buildSourcePath, buildSourcePath, packageJavaSet)
+    //需要放进第一个dex的class文件
+    Set<String> packageClassSet = new HashSet<>();
+    //解压出来的文件
+    def outJarPath = null
+    if (buildType.equals("debug")) {
+        outJarPath = getJarUnzipFile(jarDebugPath)
+        //解压
+        unZip(jarDebugPath)
+    } else {
+        outJarPath = getJarUnzipFile(jarReleasePath)
+        //解压
+        unZip(jarReleasePath)
+    }
+    if (buildType.equals("release")) {
+        //通过mapping.txt去找
+        readByLine(mappingTxtPath, new OnReadingLineCallback() {
+            @Override
+            void onLine(String line) {
+                if (line.endsWith(":")) {
+                    def mappings = line.split(" -> ")
+                    if (mappings.length != 2) {
+                        return;
+                    }
+                    def second = mappings[1].trim()
+                    def mappingJavaName = second.substring(0, second.length() - 1)
+                    for (Iterator<String> iterator = packageJavaSet.iterator(); iterator.hasNext();) {
+                        def packageJava = iterator.next()
+                        if (line.startsWith(packageJava)) {
+                            packageClassSet.add(mappingJavaName.replace(".", File.separator) + ".class")
+                        }
+                    }
+                }
+            }
+        })
+    }
+    //debug找内部类 release找没有混淆的内部类
+    for (Iterator<String> iterator = packageJavaSet.iterator(); iterator.hasNext();) {
+        def packageJava = iterator.next()
+        def javaName = packageJava.replace(".", File.separator).split(File.separator)[packageJava.replace(".", File.separator).split(File.separator).length - 1]
+        def sb = new StringBuilder();
+        for (int i = 0; i < packageJava.replace(".", File.separator).split(File.separator).length - 1; i++) {
+            sb.append(packageJava.replace(".", File.separator).split(File.separator)[i])
+            sb.append(File.separator)
+        }
+        def packagePath = outJarPath + sb.toString()
+        def dir = new File(packagePath)
+        if (dir.exists() && dir.isDirectory()) {
+            def files = dir.listFiles()
+            for (File file : files) {
+                if (!file.isDirectory()) {
+                    //找到内部类
+                    if (file.getName().startsWith(javaName)) {
+                        def clazz = file.getAbsolutePath().replace(outJarPath, "").replace(File.separator, '.')
+                        packageClassSet.add(clazz)
+                    }
+                }
+            }
+        }
+    }
+    //先将系统的复制过来
+    copyFile(mainDexListPath, multiDexKeepPath, false)
+    //复制multidex support包
+    copyFile(supportKeepPath, multiDexKeepPath, true)
+    //把class写到multidex.keep
+    writeFileIfNotExist(mainDexListPath, multiDexKeepPath, packageClassSet)
+    //删除解压出来的jar文件
+    deleteUnzipJarFiles(outJarPath)
+    println("Finish")
+}
+
+/**
+ * 找组件
+ * @param flavor
+ * @param buildType
+ * @param needFindDependencyList
+ * @return
+ */
+def findComponent(String flavor, String buildType, Set<String> needFindDependencyList) {
+    readByLine("${project.rootDir}${File.separator}" +
+            "app${File.separator}" +
+            "build${File.separator}" +
+            "intermediates${File.separator}" +
+            "multi-dex${File.separator}" +
+            "${flavor}${File.separator}" +
+            "${buildType}${File.separator}" +
+            "manifest_keep.txt",
+            new OnReadingLineCallback() {
+                @Override
+                void onLine(String line) {
+                    //组件
+                    if (line.startsWith("-keep class ") && line.endsWith(" { <init>(); }")) {
+                        needFindDependencyList.add(line.substring("-keep class ".length(), line.length() - " { <init>(); }".length()))
+                    } else if (line.startsWith("-keep class ") && line.endsWith(" {") && !line.contains("*")) {
+                        //Application
+                        needFindDependencyList.add(line.substring("-keep class ".length(), line.length() - " {".length()))
+                    }
+                }
+            })
+}
+/**
+ * 需要放在第一个dex的Presenter去查找依赖 && Injecter
+ * @param needFindDependencyList
+ */
+def findNeededPresenters(Set<String> needFindDependencyList) {
+    //presenter
+    needFindDependencyList.add("com.yydcdut.note.presenters.home.impl.SplashPresenterImpl")
+    needFindDependencyList.add("com.yydcdut.note.presenters.home.impl.IntroducePresenterImpl")
+    needFindDependencyList.add("com.yydcdut.note.presenters.home.impl.HomePresenterImpl")
+    needFindDependencyList.add("com.yydcdut.note.presenters.home.impl.AlbumPresenterImpl")
+    needFindDependencyList.add("com.yydcdut.note.presenters.ThemePresenter")
+    needFindDependencyList.add("com.yydcdut.note.presenters.service.impl.CameraServicePresenterImpl")
+    needFindDependencyList.add("com.yydcdut.note.presenters.service.impl.SandBoxServicePresenterImpl")
+    //inject
+    needFindDependencyList.add("com.yydcdut.note.injector.componet.ActivityComponent")
+    needFindDependencyList.add("com.yydcdut.note.injector.componet.ApplicationComponent")
+    needFindDependencyList.add("com.yydcdut.note.injector.componet.FragmentComponent")
+    needFindDependencyList.add("com.yydcdut.note.injector.componet.ServiceComponent")
+    needFindDependencyList.add("com.yydcdut.note.injector.module.ActivityModule")
+    needFindDependencyList.add("com.yydcdut.note.injector.module.ApplicationModule")
+    needFindDependencyList.add("com.yydcdut.note.injector.module.FragmentModule")
+    needFindDependencyList.add("com.yydcdut.note.injector.module.ServiceModule")
+    //注解
+    needFindDependencyList.add("com.yydcdut.note.injector.ContextLife")
+    needFindDependencyList.add("com.yydcdut.note.injector.PerActivity")
+    needFindDependencyList.add("com.yydcdut.note.injector.PerFragment")
+    needFindDependencyList.add("com.yydcdut.note.injector.PerService")
+}
+/**
+ * build中生成的代码，找到这些类的依赖
+ * @param buildSourcePath
+ * @param packageJavaSetList
+ * @return
+ */
+def addAllBuildDependency(String buildSourcePath, Set<String> packageJavaSetList) {
+    def dir = new File(buildSourcePath)
+    getJavaFileInDir(dir, packageJavaSetList)
+}
+
+/**
+ * 利用递归找出所有的文件夹或者文件里面的import的类
+ * @param dirOrFile
+ * @param packageJavaSet
+ * @return
+ */
+def getJavaFileInDir(File dirOrFile, Set<String> packageJavaSet) {
+    if (dirOrFile.isDirectory()) {
+        def files = dirOrFile.listFiles()
+        for (File file : files) {
+            getJavaFileInDir(file, packageJavaSet)
+        }
+    } else {
+        getDependentJava(dirOrFile, packageJavaSet)
+    }
+}
+
+/**
+ * 得到该Java文件的import的类
+ * @param path
+ * @param packageJavaSet
+ * @return
+ */
+def getDependentJava(File file, Set<String> packageJavaSet) {
+    def content = readFile(file)
+    def pattern = Pattern.compile("import *");
+    def packageJavas = pattern.split(content);
+    for (int i = 1; i < packageJavas.length - 1; i++) {
+        def packageJava = packageJavas[i].trim()
+        //系统的不要
+        if (packageJava.startsWith("java") || (packageJava.startsWith("android") && !packageJava.startsWith("android.support"))
+                || packageJava.startsWith(" ") || packageJava.startsWith("static")) {
+            continue;
+        } else {
+            //去掉分号
+            packageJavaSet.add(packageJava.substring(0, packageJava.length() - 1))
+        }
+    }
+    String lastOne = packageJavas[packageJavas.length - 1]
+    String lastPackage = lastOne.split("\n")[0]
+    if (lastPackage.trim().startsWith("java") || (lastPackage.trim().startsWith("android") && !lastPackage.trim().startsWith("android.support"))
+            || lastPackage.trim().startsWith(" ") || lastPackage.trim().startsWith("static")) {
+        // do nothing
+    } else {
+        packageJavaSet.add(lastPackage.trim().substring(0, lastPackage.trim().length() - 1))
+    }
+}
+
+/**
+ * build中生成的代码，将此代码加进去
+ * @param buildPath
+ * @param currentPath
+ * @param packageJavaSet
+ * @return
+ */
+def addBuildSelf(String buildPath, String currentPath, Set<String> packageJavaSet) {
+    def dir = new File(currentPath)
+    if (dir.isDirectory()) {
+        for (File file : dir.listFiles()) {
+            if (file.isDirectory()) {
+                addBuildSelf(buildPath, file.getAbsolutePath(), packageJavaSet)
+            } else {
+                def packageJava = file.getAbsolutePath().substring(buildPath.length(), file.getAbsolutePath().length() - ".java".length())
+                packageJavaSet.add(packageJava.replace(File.separator, '.'))
+            }
+        }
+    } else {
+        def packageJava = dir.getAbsolutePath().substring(buildPath.length(), dir.getAbsolutePath().length() - ".java".length())
+        packageJavaSet.add(packageJava.replace(File.separator, '.'))
+    }
+}
+
+/**
+ * 解压Jar
+ * @param jarFilePath
+ */
+def unZip(String jarFilePath) {
+    def outJarPath = getJarUnzipFile(jarFilePath)
+    def jarFile = new JarFile(jarFilePath)
+    Enumeration<JarEntry> jarEntries = jarFile.entries()
+    while (jarEntries.hasMoreElements()) {
+        JarEntry jarEntry = jarEntries.nextElement()
+        String outFileName = outJarPath + jarEntry.getName()
+        File f = new File(outFileName)
+        makeSupDir(outFileName)
+        if (jarEntry.isDirectory()) {
+            continue;
+        }
+        writeFileIfNotExist(jarFile.getInputStream(jarEntry), f)
+    }
+}
+
+/**
+ * 创建文件夹
+ * @param outFileName
+ */
+def makeSupDir(String outFileName) {
+    Pattern p = Pattern.compile("[/\\\\" + File.separator + "]");
+    Matcher m = p.matcher(outFileName);
+    while (m.find()) {
+        int index = m.start();
+        String subDir = outFileName.substring(0, index);
+        File subDirFile = new File(subDir);
+        if (!subDirFile.exists())
+            subDirFile.mkdir();
+    }
+}
+
+/**
+ * 得到解压Jar的文件夹地址
+ * @param jarFilePath
+ * @return
+ */
+def getJarUnzipFile(String jarFilePath) {
+    Pattern pattern = Pattern.compile('allclasses.jar$|classes.jar$');//debug|release
+    Matcher matcher = pattern.matcher(jarFilePath);
+    String path = matcher.replaceAll("");
+    def totalPath = "${path}photonoter/"
+    def file = new File(totalPath)
+    if (!file.exists()) {
+        file.mkdir()
+    }
+    return "${file.getAbsolutePath()}${File.separator}"
+}
+
+/**
+ * 删除解压出来的Jar的文件夹的地址
+ * @param jarFilePath
+ * @return
+ */
+def deleteUnzipJarFiles(String jarFilePath) {
+    def path = getJarUnzipFile(jarFilePath)
+    def dir = new File(path)
+    if (!dir.exists() || !dir.isDirectory()) {
+        return;
+    }
+    deleteDir(jarFilePath)
+}
+
+/**
+ * 递归删除文件
+ * @param jarFilePath
+ * @return
+ */
+def deleteDir(String jarFilePath) {
+    def dir = new File(jarFilePath)
+    if (!dir.exists() || !dir.isDirectory()) {
+        return;
+    }
+    def files = dir.listFiles()
+    for (File file : files) {
+        if (file.isDirectory()) {
+            deleteDir(file.getAbsolutePath())
+        } else {
+            file.delete()
+        }
+    }
+    dir.delete()
+}
+
+/**
+ * 写文件
+ * @param ips
+ * @param outputFile
+ * @return
+ */
+def writeFileIfNotExist(InputStream ips, File outputFile) {
+    def ops = new BufferedOutputStream(new FileOutputStream(outputFile))
+    def buffer = new byte[1024]
+    def nBytes = 0
+    while ((nBytes = ips.read(buffer)) > 0) {
+        ops.write(buffer, 0, nBytes)
+    }
+    ops.flush()
+    ops.close()
+    ips.close()
+}
+
+/**
+ * 读文件
+ * @param file
+ * @return
+ */
+def readFile(File file) {
+    def fis = new FileInputStream(file)
+    def bytes = new byte[10]
+    def len = -1
+    StringBuilder sb = new StringBuilder()
+    while ((len = fis.read(bytes)) != -1) {
+        sb.append(new String(bytes, 0, len))
+    }
+    fis.close()
+    return sb.toString()
+}
+
+def readFile(String path) {
+    def file = new File(path)
+    return readFile(file)
+}
+
+/**
+ * 一行一行的读文件，每读一行回调一下
+ * @param path
+ * @param callback
+ * @return
+ */
+def readByLine(String path, OnReadingLineCallback callback) {
+    if (callback != null) {
+        Reader fileReader = new FileReader(new File(path))
+        BufferedReader br = new BufferedReader(fileReader)
+        String line = br.readLine()
+        while (line != null) {
+            callback.onLine(line);
+            line = br.readLine();
+        }
+        br.close()
+        fileReader.close()
+    }
+}
+/**
+ * 回调
+ */
+interface OnReadingLineCallback {
+    void onLine(String line)
+}
+
+/**
+ * 将一个set写到一个文件里面
+ * @param existCheckPath
+ * @param path
+ * @param set
+ * @return
+ */
+def writeFileIfNotExist(String existCheckPath, String path, Set<String> set) {
+    def content = readFile(existCheckPath)
+    OutputStream os = new FileOutputStream(path, true);
+    for (Iterator<String> iterator = set.iterator(); iterator.hasNext();) {
+        String clazz = iterator.next().replace(".", File.separator)
+        if (content.contains(clazz)) {
+            continue;
+        }
+        def temp = clazz.getBytes()
+        os.write(temp)
+        def newLine = System.getProperty("line.separator").getBytes()
+        os.write(newLine)
+    }
+    os.flush();
+    os.close()
+}
+
+/**
+ * 复制文件
+ * @param from
+ * @param to
+ * @return
+ */
+def copyFile(String from, String to, boolean append) {
+    def byteread = 0;
+    def input = new FileInputStream(from); ;
+    def out = new FileOutputStream(to, append); ;
+    def buffer = new byte[1024];
+    while ((byteread = input.read(buffer)) != -1) {
+        out.write(buffer, 0, byteread);
+    }
+    out.flush()
+    input.close()
+    out.close()
+}
